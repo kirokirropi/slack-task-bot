@@ -5,7 +5,7 @@
 // - Clicking it updates the card, adds a ✅ to the original message and posts a completion alert.
 // - pg_cron calls this function with ?action=remind at 8 AM, 12 PM and 3 PM Philippine time,
 //   and it posts a reminder for every task that's still open.
-// - A task ending in a time ("Task: Pay invoice @ 2:30pm") is instead reminded daily at that time:
+// - A task with its own time ("Task: Pay invoice every 3pm", "... @ 2:30pm") is instead reminded daily at that time:
 //   a per-minute pg_cron check calls ?action=remind_custom only when such a task is due.
 //
 // Secrets (Supabase dashboard > Edge Functions > Secrets):
@@ -26,27 +26,33 @@ const DONE_EMOJI = "white_check_mark";
 const MAX_TASK_TEXT_IN_VALUE = 1500;
 // Each card's first block_id is "task:<original message ts>".
 const TASK_BLOCK_PREFIX = "task:";
-// Optional custom reminder time at the end of a task: "@ 2:30pm", "@2pm", "@ 14:30", "remind at 9am".
-const REMIND_TIME_RE = /\s*(?:@|remind(?:\s+me)?\s+at)\s*(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?\s*$/i;
-const REMIND_TIME_24H_RE = /\s*(?:@|remind(?:\s+me)?\s+at)\s*(\d{1,2}):(\d{2})\s*$/i;
+// Optional custom reminder time, anywhere in the task: "every 3pm", "every day at 10am", "daily 4:15 PM",
+// "@ 2:30pm", "@ 14:30", "remind me at 9am". A bare "at 3pm" is NOT a reminder time ("Meet at 3pm").
+const TIME_PART = String.raw`(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?|(\d{1,2}):(\d{2})`;
+const REMIND_TIME_RE = new RegExp(
+  String.raw`(?:^|\s)(?:@|every\s*day(?:\s+at)?|every(?:\s+at)?|daily(?:\s+at)?|remind(?:\s+me)?\s+at)\s*(?:${TIME_PART})` +
+    String.raw`(?=$|[\s.,;:!?)"'”’])`,
+  "i",
+);
 
-/** Splits a trailing reminder time off the task text. Returns 24h "HH:MM" (Philippine time) or null. */
+/** Finds a reminder time in the task. Returns 24h "HH:MM" (Philippine time) or null.
+ *  A time at the very end is removed from the text; one mid-sentence is left in place. */
 function parseRemindTime(text: string): { text: string; time: string | null } {
+  const m = REMIND_TIME_RE.exec(text);
+  if (!m) return { text, time: null };
   let hour: number, minute: number;
-  let m = REMIND_TIME_RE.exec(text);
-  if (m) {
+  if (m[1] !== undefined) {
+    if (Number(m[1]) < 1 || Number(m[1]) > 12) return { text, time: null };
     hour = Number(m[1]) % 12 + (m[3].toLowerCase() === "p" ? 12 : 0);
     minute = Number(m[2] ?? 0);
-    if (Number(m[1]) < 1 || Number(m[1]) > 12) return { text, time: null };
-  } else if ((m = REMIND_TIME_24H_RE.exec(text))) {
-    hour = Number(m[1]);
-    minute = Number(m[2]);
   } else {
-    return { text, time: null };
+    hour = Number(m[4]);
+    minute = Number(m[5]);
   }
   if (hour > 23 || minute > 59) return { text, time: null };
   const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-  return { text: text.slice(0, m!.index).trim(), time };
+  const atEnd = text.slice(m.index + m[0].length).trim() === "";
+  return { text: atEnd ? text.slice(0, m.index).trim() : text, time };
 }
 
 /** "14:30" -> "2:30 PM" */
