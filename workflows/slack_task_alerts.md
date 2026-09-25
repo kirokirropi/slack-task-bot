@@ -10,7 +10,14 @@ Every message in the tasks channel that starts with `Task:` becomes a task. Othe
 - **Edge Function** `slack-task-bot` in Supabase project **slack-task-bot** (Singapore region). Find the project ref in the Supabase dashboard URL. Source: `supabase/functions/slack-task-bot/index.ts`.
 - **Request URL** (Slack Event Subscriptions and Interactivity): `https://<PROJECT_REF>.supabase.co/functions/v1/slack-task-bot`
 - **Reminders:** a `pg_cron` job, `slack-task-reminders`, runs `0 0,4,7 * * *` UTC (8 AM, 12 PM and 3 PM Philippine time) and calls the function with `?action=remind`. The call is authenticated with a random secret in Supabase Vault (`slack_bot_cron_secret`).
-- **Secrets:** set in the Supabase dashboard under Edge Functions > Secrets: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` and optionally `REMINDER_LOOKBACK_DAYS`. `TASKS_CHANNEL_ID` and `ALERTS_CHANNEL_ID` are no longer used by the Supabase version.
+- **Secrets:** set in the Supabase dashboard under Edge Functions > Secrets: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` and optionally `REMINDER_LOOKBACK_DAYS` and `SLACK_USER_TOKEN`.
+- **Removing the original `Task:` message** (optional, avoids duplicate text in the channel). A bot can only delete its own messages, so this needs a **workspace admin or owner's user token**:
+  1. In the Slack app, go to **OAuth & Permissions**, then **User Token Scopes**, and add `chat:write`.
+  2. Click **Reinstall to Workspace**. The installer must be a workspace admin or owner.
+  3. Copy the **User OAuth Token** (`xoxp-…`) and add it in Supabase as the secret `SLACK_USER_TOKEN`.
+
+  When this is set, the bot deletes each `Task:` message right after posting its card. The card keeps the full text and "Posted by @person". If it isn't set, the original message stays and gets a ✅ when the task is done.
+- **Completed cards:** the card text is struck through line by line, because Slack strikethrough doesn't span line breaks, and it shows "Posted by … · ✅ Done by … at …". `TASKS_CHANNEL_ID` and `ALERTS_CHANNEL_ID` are no longer used by the Supabase version.
 - **Watched channels:** every channel the bot is a member of. To add a channel, run `/invite @slack_alert` in it; nothing else is needed. To stop it in a channel, remove the bot with `/remove @slack_alert`. DMs are ignored.
   - Completion alerts go to the task's own channel. To send one channel's alerts elsewhere, add a row in the Supabase SQL editor: `insert into task_channels (channel_id, alerts_channel_id) values ('C<tasks>', 'C<alerts>');`
   - Reminders check every channel that had a task card in the last 30 days, plus any channel listed in `task_channels`. Each card's channel is recorded in `task_cards.channel_id`.

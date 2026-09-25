@@ -8,6 +8,8 @@
 //
 // Secrets (Supabase dashboard > Edge Functions > Secrets):
 //   SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, REMINDER_LOOKBACK_DAYS (optional, default 30)
+//   SLACK_USER_TOKEN (optional): a workspace admin's user token with chat:write. When set, the
+//   original "Task:" message is deleted once its card is posted (bots can't delete others' messages).
 // Every channel the bot is invited to is watched. Optional per-channel settings live in the
 // public.task_channels table (e.g. send a channel's completion alerts somewhere else).
 
@@ -35,7 +37,7 @@ const db = createClient(env("SUPABASE_URL"), env("SUPABASE_SERVICE_ROLE_KEY"));
 
 type Json = Record<string, unknown>;
 
-async function slack(method: string, params: Json): Promise<Json> {
+async function slack(method: string, params: Json, token = env("SLACK_BOT_TOKEN")): Promise<Json> {
   const body = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === null) continue;
@@ -43,7 +45,7 @@ async function slack(method: string, params: Json): Promise<Json> {
   }
   const res = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${env("SLACK_BOT_TOKEN")}` },
+    headers: { Authorization: `Bearer ${token}` },
     body,
   });
   const data = await res.json();
@@ -108,13 +110,23 @@ function buildTaskBlocks(taskText: string, channel: string, taskTs: string, user
   ];
 }
 
-function buildDoneBlocks(taskText: string, userId: string, taskTs: string) {
+/** Slack strikethrough doesn't span line breaks, so strike each line separately. */
+function strikethrough(text: string): string {
+  return text.split("\n").map((line) => (line.trim() ? `~${line.trim()}~` : line)).join("\n");
+}
+
+function buildDoneBlocks(taskText: string, userId: string, taskTs: string, postedBy?: string) {
   const now = Math.floor(Date.now() / 1000);
   const fallback = new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC";
   const when = `<!date^${now}^{date_short_pretty} at {time}|${fallback}>`;
+  const byLine = postedBy ? `Posted by <@${postedBy}> · ` : "";
   return [
-    { type: "section", block_id: `${TASK_BLOCK_PREFIX}${taskTs}`, text: { type: "mrkdwn", text: `:memo: ~${taskText}~` } },
-    { type: "context", elements: [{ type: "mrkdwn", text: `:white_check_mark: Done by <@${userId}> ${when}` }] },
+    {
+      type: "section",
+      block_id: `${TASK_BLOCK_PREFIX}${taskTs}`,
+      text: { type: "mrkdwn", text: `:memo: ~Task:~\n${strikethrough(taskText)}` },
+    },
+    { type: "context", elements: [{ type: "mrkdwn", text: `${byLine}:white_check_mark: Done by <@${userId}> ${when}` }] },
   ];
 }
 
@@ -170,8 +182,10 @@ async function handleMessage(event: any) {
   if (!taskText) return; // normal chat, not a task
   if (!(await claimOnce("task_cards", { task_ts: event.ts, channel_id: event.channel }))) return;
 
+  const userToken = Deno.env.get("SLACK_USER_TOKEN");
   try {
-    const link = await permalink(event.channel, event.ts);
+    // With a user token the original message is removed below, so don't link to it.
+    const link = userToken ? "" : await permalink(event.channel, event.ts);
     // Posted as its own channel message (not a thread reply) so the button is visible in the channel.
     await slack("chat.postMessage", {
       channel: event.channel,
@@ -183,12 +197,21 @@ async function handleMessage(event: any) {
     throw e;
   }
   console.log("Created task for message", event.ts);
+
+  // Remove the original "Task:" message so the card is the only copy in the channel.
+  if (userToken) {
+    try {
+      await slack("chat.delete", { channel: event.channel, ts: event.ts }, userToken);
+    } catch (e) {
+      console.warn("Could not delete original task message:", e); // e.g. cant_delete_message
+    }
+  }
 }
 
 // deno-lint-ignore no-explicit-any
 async function handleDone(payload: any) {
   const data = JSON.parse(payload.actions[0].value);
-  const { channel, ts: taskTs, text: taskText } = data;
+  const { channel, ts: taskTs, text: taskText, user: postedBy } = data;
   const userId = payload.user.id;
   if (!(await claimOnce("completed_tasks", { task_ts: taskTs, completed_by: userId }))) {
     console.log("Task already done; ignoring click", taskTs);
@@ -201,22 +224,22 @@ async function handleDone(payload: any) {
       channel: payload.channel.id,
       ts: payload.message.ts,
       text: `Done: ${taskText}`,
-      blocks: buildDoneBlocks(taskText, userId, taskTs),
+      blocks: buildDoneBlocks(taskText, userId, taskTs, postedBy),
     });
   } catch (e) {
     await db.from("completed_tasks").delete().eq("task_ts", taskTs); // let another click try again
     throw e;
   }
 
-  // 2. Mark the original message with a ✅ reaction.
+  // 2. Mark the original message with a ✅ reaction (if it wasn't removed).
   try {
     await slack("reactions.add", { channel, timestamp: taskTs, name: DONE_EMOJI });
   } catch (e) {
-    console.warn("Could not add reaction:", e); // e.g. already_reacted
+    if (!String(e).includes("message_not_found")) console.warn("Could not add reaction:", e);
   }
 
-  // 3. Post the completion alert.
-  const link = await permalink(channel, taskTs);
+  // 3. Post the completion alert, linking to the (now struck-through) card.
+  const link = await permalink(payload.channel.id, payload.message.ts);
   const linkText = link ? ` (<${link}|view task>)` : "";
   const alertsChannel = await alertsChannelFor(channel);
   await slack("chat.postMessage", {
