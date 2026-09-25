@@ -1,0 +1,344 @@
+// Slack task bot, hosted on Supabase so it runs without anyone's PC.
+//
+// - Slack sends message events and button clicks here (Events API + Interactivity Request URL).
+// - A "Task: ..." message in any channel the bot is a member of gets a separate card with a "Mark as Done" button.
+// - Clicking it updates the card, adds a ✅ to the original message and posts a completion alert.
+// - pg_cron calls this function with ?action=remind at 8 AM, 12 PM and 3 PM Philippine time,
+//   and it posts a reminder for every task that's still open.
+//
+// Secrets (Supabase dashboard > Edge Functions > Secrets):
+//   SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, REMINDER_LOOKBACK_DAYS (optional, default 30)
+// Every channel the bot is invited to is watched. Optional per-channel settings live in the
+// public.task_channels table (e.g. send a channel's completion alerts somewhere else).
+
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "jsr:@supabase/supabase-js@2";
+
+const DONE_ACTION_ID = "mark_task_done";
+// Only messages starting with "Task:" (any case, optionally bold/italic) are tasks.
+const TASK_PREFIX_RE = /^\s*[*_]*task\s*:\s*[*_]*\s*([\s\S]+)$/i;
+const DONE_EMOJI = "white_check_mark";
+// Slack caps a button value at 2000 chars; keep room for the JSON wrapper.
+const MAX_TASK_TEXT_IN_VALUE = 1500;
+// Each card's first block_id is "task:<original message ts>".
+const TASK_BLOCK_PREFIX = "task:";
+
+function env(name: string, fallback?: string): string {
+  const value = Deno.env.get(name) ?? fallback;
+  if (!value) throw new Error(`Missing secret ${name}`);
+  return value;
+}
+
+const db = createClient(env("SUPABASE_URL"), env("SUPABASE_SERVICE_ROLE_KEY"));
+
+// ---------- Slack helpers ----------
+
+type Json = Record<string, unknown>;
+
+async function slack(method: string, params: Json): Promise<Json> {
+  const body = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null) continue;
+    body.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+  }
+  const res = await fetch(`https://slack.com/api/${method}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env("SLACK_BOT_TOKEN")}` },
+    body,
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(`${method} failed: ${data.error}`);
+  return data;
+}
+
+async function permalink(channel: string, ts: string): Promise<string> {
+  try {
+    return (await slack("chat.getPermalink", { channel, message_ts: ts })).permalink as string;
+  } catch (e) {
+    console.warn("Could not fetch permalink:", e); // link is nice-to-have, not critical
+    return "";
+  }
+}
+
+let cachedBotId: string | null = null;
+async function botId(): Promise<string> {
+  cachedBotId ??= (await slack("auth.test", {})).bot_id as string;
+  return cachedBotId;
+}
+
+async function verifySlackSignature(req: Request, rawBody: string): Promise<boolean> {
+  const ts = req.headers.get("x-slack-request-timestamp");
+  const sig = req.headers.get("x-slack-signature");
+  if (!ts || !sig || Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(env("SLACK_SIGNING_SECRET")),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`v0:${ts}:${rawBody}`));
+  const expected = "v0=" + [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  // constant-time compare
+  if (expected.length !== sig.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
+  return diff === 0;
+}
+
+// ---------- Blocks ----------
+
+function buildTaskBlocks(taskText: string, channel: string, taskTs: string, userId?: string, link = "") {
+  const value = JSON.stringify({ channel, ts: taskTs, user: userId, text: taskText.slice(0, MAX_TASK_TEXT_IN_VALUE) });
+  let postedBy = userId ? `Posted by <@${userId}>` : "Task";
+  if (link) postedBy += ` · <${link}|view message>`;
+  return [
+    { type: "section", block_id: `${TASK_BLOCK_PREFIX}${taskTs}`, text: { type: "mrkdwn", text: `:memo: *Task:* ${taskText}` } },
+    { type: "context", elements: [{ type: "mrkdwn", text: postedBy }] },
+    {
+      type: "actions",
+      elements: [{
+        type: "button",
+        text: { type: "plain_text", text: "✅ Mark as Done", emoji: true },
+        style: "primary",
+        action_id: DONE_ACTION_ID,
+        value,
+      }],
+    },
+  ];
+}
+
+function buildDoneBlocks(taskText: string, userId: string, taskTs: string) {
+  const now = Math.floor(Date.now() / 1000);
+  const fallback = new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  const when = `<!date^${now}^{date_short_pretty} at {time}|${fallback}>`;
+  return [
+    { type: "section", block_id: `${TASK_BLOCK_PREFIX}${taskTs}`, text: { type: "mrkdwn", text: `:memo: ~${taskText}~` } },
+    { type: "context", elements: [{ type: "mrkdwn", text: `:white_check_mark: Done by <@${userId}> ${when}` }] },
+  ];
+}
+
+// deno-lint-ignore no-explicit-any
+function doneButton(message: any): any | null {
+  for (const block of message.blocks ?? []) {
+    if (block.type !== "actions") continue;
+    for (const el of block.elements ?? []) if (el.action_id === DONE_ACTION_ID) return el;
+  }
+  return null;
+}
+
+// ---------- Channels ----------
+
+/** Where a channel's completion alerts go: its task_channels override, else the channel itself. */
+async function alertsChannelFor(channel: string): Promise<string> {
+  const { data, error } = await db
+    .from("task_channels").select("alerts_channel_id").eq("channel_id", channel).maybeSingle();
+  if (error) throw error;
+  return data?.alerts_channel_id ?? channel;
+}
+
+/** Channels to check for open tasks: any with a task card in the lookback window, plus configured ones. */
+async function reminderChannels(lookbackDays: number): Promise<Set<string>> {
+  const since = new Date(Date.now() - lookbackDays * 86400_000).toISOString();
+  const [cards, configured] = await Promise.all([
+    db.from("task_cards").select("channel_id").gte("created_at", since).not("channel_id", "is", null),
+    db.from("task_channels").select("channel_id"),
+  ]);
+  if (cards.error) throw cards.error;
+  if (configured.error) throw configured.error;
+  return new Set([...cards.data, ...configured.data].map((r) => r.channel_id as string));
+}
+
+// ---------- Handlers ----------
+
+/** Returns true the first time a key is claimed; false if it was already claimed (retry / double click). */
+async function claimOnce(table: string, row: Json): Promise<boolean> {
+  const { error } = await db.from(table).insert(row);
+  if (!error) return true;
+  if (error.code === "23505") return false; // unique violation: already handled
+  throw error;
+}
+
+// deno-lint-ignore no-explicit-any
+async function handleMessage(event: any) {
+  // Only new, top-level, human messages starting with "Task:" become tasks.
+  // Slack only sends messages from channels the bot is in, so every such channel is watched.
+  if (event.subtype || event.bot_id || event.thread_ts) return;
+  if (event.channel_type === "im" || event.channel_type === "mpim") return; // not DMs
+  const match = TASK_PREFIX_RE.exec(event.text ?? "");
+  const taskText = match?.[1].trim();
+  if (!taskText) return; // normal chat, not a task
+  if (!(await claimOnce("task_cards", { task_ts: event.ts, channel_id: event.channel }))) return;
+
+  try {
+    const link = await permalink(event.channel, event.ts);
+    // Posted as its own channel message (not a thread reply) so the button is visible in the channel.
+    await slack("chat.postMessage", {
+      channel: event.channel,
+      text: `Task: ${taskText}`,
+      blocks: buildTaskBlocks(taskText, event.channel, event.ts, event.user, link),
+    });
+  } catch (e) {
+    await db.from("task_cards").delete().eq("task_ts", event.ts); // let a retry try again
+    throw e;
+  }
+  console.log("Created task for message", event.ts);
+}
+
+// deno-lint-ignore no-explicit-any
+async function handleDone(payload: any) {
+  const data = JSON.parse(payload.actions[0].value);
+  const { channel, ts: taskTs, text: taskText } = data;
+  const userId = payload.user.id;
+  if (!(await claimOnce("completed_tasks", { task_ts: taskTs, completed_by: userId }))) {
+    console.log("Task already done; ignoring click", taskTs);
+    return;
+  }
+
+  // 1. Replace the card (removes the button).
+  try {
+    await slack("chat.update", {
+      channel: payload.channel.id,
+      ts: payload.message.ts,
+      text: `Done: ${taskText}`,
+      blocks: buildDoneBlocks(taskText, userId, taskTs),
+    });
+  } catch (e) {
+    await db.from("completed_tasks").delete().eq("task_ts", taskTs); // let another click try again
+    throw e;
+  }
+
+  // 2. Mark the original message with a ✅ reaction.
+  try {
+    await slack("reactions.add", { channel, timestamp: taskTs, name: DONE_EMOJI });
+  } catch (e) {
+    console.warn("Could not add reaction:", e); // e.g. already_reacted
+  }
+
+  // 3. Post the completion alert.
+  const link = await permalink(channel, taskTs);
+  const linkText = link ? ` (<${link}|view task>)` : "";
+  const alertsChannel = await alertsChannelFor(channel);
+  await slack("chat.postMessage", {
+    channel: alertsChannel,
+    text: `✅ Task completed: ${taskText} — by <@${userId}>`,
+    blocks: [{
+      type: "section",
+      text: { type: "mrkdwn", text: `:white_check_mark: *Task completed*${linkText}\n>${taskText}\nCompleted by <@${userId}>` },
+    }],
+  });
+  console.log("Task marked done", taskTs, "by", userId);
+}
+
+type OpenTask = { threadTs: string; user?: string; text: string };
+
+/** Open tasks = bot cards that still have the Mark as Done button. */
+async function findOpenTasks(channel: string, lookbackDays: number): Promise<OpenTask[]> {
+  // Slack returns nothing if the timestamp has more than 6 decimal places.
+  const oldest = (Date.now() / 1000 - lookbackDays * 86400).toFixed(6);
+  const me = await botId();
+  const open: OpenTask[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await slack("conversations.history", { channel, oldest, limit: 200, cursor });
+    // deno-lint-ignore no-explicit-any
+    for (const msg of page.messages as any[]) {
+      // Current format: the card is its own channel post.
+      if (msg.bot_id === me) {
+        const button = doneButton(msg);
+        if (button) {
+          const v = JSON.parse(button.value);
+          open.push({ threadTs: msg.ts, user: v.user ?? undefined, text: v.text });
+        }
+        continue;
+      }
+      // Older format: the card is a reply in the task message's thread.
+      if (msg.subtype || msg.bot_id || !msg.reply_count) continue;
+      const match = TASK_PREFIX_RE.exec(msg.text ?? "");
+      if (!match) continue;
+      const replies = await slack("conversations.replies", { channel, ts: msg.ts, limit: 200 });
+      // deno-lint-ignore no-explicit-any
+      if ((replies.messages as any[]).some((r) => r.bot_id === me && doneButton(r))) {
+        open.push({ threadTs: msg.ts, user: msg.user, text: match[1].trim() });
+      }
+    }
+    // deno-lint-ignore no-explicit-any
+    cursor = (page.response_metadata as any)?.next_cursor || undefined;
+  } while (cursor);
+  return open;
+}
+
+async function sendReminders() {
+  const lookbackDays = Number(env("REMINDER_LOOKBACK_DAYS", "30"));
+  for (const channel of await reminderChannels(lookbackDays)) {
+    try {
+      await sendRemindersForChannel(channel, lookbackDays);
+    } catch (e) {
+      console.error(`Reminders failed for channel ${channel}:`, e); // don't let one channel block the others
+    }
+  }
+}
+
+async function sendRemindersForChannel(channel: string, lookbackDays: number) {
+  const tasks = await findOpenTasks(channel, lookbackDays);
+  for (const task of tasks.reverse()) { // oldest first
+    const who = task.user ? `<@${task.user}> ` : "";
+    const link = await permalink(channel, task.threadTs);
+    const linkText = link ? ` · <${link}|open task>` : "";
+    // Posted as its own channel message (not a thread reply) so it's visible in the channel.
+    await slack("chat.postMessage", {
+      channel,
+      text: `:alarm_clock: ${who}Reminder: this task is still not done — ${task.text}`,
+      blocks: [{
+        type: "section",
+        text: { type: "mrkdwn", text: `:alarm_clock: *Reminder:* ${who}this task is still not done${linkText}\n>${task.text}` },
+      }],
+    });
+  }
+  console.log(`Sent ${tasks.length} reminder(s) in ${channel}`);
+}
+
+function background(work: Promise<unknown>) {
+  EdgeRuntime.waitUntil(work.catch((e) => console.error("Background task failed:", e)));
+}
+
+// ---------- Entry point ----------
+
+Deno.serve(async (req) => {
+  const url = new URL(req.url);
+
+  // Scheduled reminders (pg_cron). Authenticated with a secret stored in Supabase Vault.
+  if (url.searchParams.get("action") === "remind") {
+    const { data: secret, error } = await db.rpc("slack_bot_cron_secret");
+    if (error || !secret || req.headers.get("x-cron-secret") !== secret) {
+      return new Response("forbidden", { status: 403 });
+    }
+    background(sendReminders());
+    return new Response("reminders queued", { status: 202 });
+  }
+
+  const rawBody = await req.text();
+  if (!(await verifySlackSignature(req, rawBody))) {
+    return new Response("invalid signature", { status: 401 });
+  }
+
+  // Button clicks arrive form-encoded with a JSON "payload" field.
+  if ((req.headers.get("content-type") ?? "").includes("application/x-www-form-urlencoded")) {
+    const payload = JSON.parse(new URLSearchParams(rawBody).get("payload") ?? "{}");
+    if (payload.type === "block_actions" && payload.actions?.[0]?.action_id === DONE_ACTION_ID) {
+      background(handleDone(payload));
+    }
+    return new Response("", { status: 200 }); // ack within 3 seconds
+  }
+
+  const body = JSON.parse(rawBody);
+  if (body.type === "url_verification") {
+    return new Response(body.challenge, { headers: { "Content-Type": "text/plain" } });
+  }
+  // Slack retries if we were slow; the first delivery is already being handled.
+  if (req.headers.get("x-slack-retry-num")) return new Response("", { status: 200 });
+  if (body.type === "event_callback" && body.event?.type === "message") {
+    background(handleMessage(body.event));
+  }
+  return new Response("", { status: 200 });
+});

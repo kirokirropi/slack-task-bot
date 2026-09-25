@@ -1,0 +1,22 @@
+# Secrets: never commit
+.env
+.env.*
+!.env.example
+credentials.json
+token.json
+supabase/.temp/
+supabase/.env
+supabase/functions/.env
+
+# Local state and build output
+.tmp/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
