@@ -4,7 +4,7 @@
 // - A "Task: ..." message in any channel the bot is a member of gets a separate card with a "Mark as Done" button.
 // - Clicking it updates the card, adds a ✅ to the original message and posts a completion alert.
 // - pg_cron calls this function with ?action=remind at 7 AM and 3 PM Philippine time,
-//   and it posts a reminder for every task that's still open.
+//   and it posts one summary per channel listing the tasks that are still open, with links.
 // - A task with its own time ("Task: Pay invoice every 3pm", "... @ 2:30pm") is instead reminded daily at that time:
 //   a per-minute pg_cron check calls ?action=remind_custom only when such a task is due.
 //
@@ -350,18 +350,59 @@ async function sendReminders() {
   }
 }
 
-/** Default schedule (7 AM / 3 PM): every open task except those with their own reminder time. */
+/** One-line preview of a task for the summary: first line, shortened without cutting a <...> mention/link. */
+function preview(text: string, max = 120): string {
+  let line = text.replace(/\s*\n+\s*/g, " ").trim();
+  if (line.length <= max) return line;
+  line = line.slice(0, max);
+  const open = line.lastIndexOf("<");
+  if (open > line.lastIndexOf(">")) line = line.slice(0, open); // don't cut a <@user> or <link|text> in half
+  return line.trimEnd() + "…";
+}
+
+/** Default schedule (7 AM / 3 PM): one summary post per channel listing its pending tasks with links.
+ *  Tasks with their own reminder time are left out; they're reminded individually at their time. */
 async function sendRemindersForChannel(channel: string, lookbackDays: number) {
   const { data: custom, error } = await db
     .from("task_cards").select("task_ts").eq("channel_id", channel).not("remind_time", "is", null);
   if (error) throw error;
   const hasCustomTime = new Set(custom.map((r) => r.task_ts));
 
-  const tasks = (await findOpenTasks(channel, lookbackDays)).filter((t) => !hasCustomTime.has(t.taskTs));
-  for (const task of tasks.reverse()) { // oldest first
-    await postReminder(channel, task.threadTs, task.user, task.text);
+  const tasks = (await findOpenTasks(channel, lookbackDays)).filter((t) => !hasCustomTime.has(t.taskTs)).reverse();
+  if (!tasks.length) {
+    console.log(`No pending tasks in ${channel}; no summary sent`);
+    return;
   }
-  console.log(`Sent ${tasks.length} reminder(s) in ${channel}`);
+
+  const lines: string[] = [];
+  for (const task of tasks) { // oldest first
+    const link = await permalink(channel, task.threadTs);
+    const who = task.user ? ` · <@${task.user}>` : "";
+    lines.push(`• ${preview(task.text)}${link ? ` · <${link}|open task>` : ""}${who}`);
+  }
+
+  // A section's text is capped at 3000 chars, so split long lists across sections.
+  const sections: string[] = [];
+  let current = "";
+  for (const line of lines) {
+    if (current && current.length + line.length + 1 > 2900) {
+      sections.push(current);
+      current = "";
+    }
+    current += (current ? "\n" : "") + line;
+  }
+  sections.push(current);
+
+  const title = `:clipboard: *Pending tasks (${tasks.length})*`;
+  await slack("chat.postMessage", {
+    channel,
+    text: `Pending tasks (${tasks.length})`,
+    blocks: [
+      { type: "section", text: { type: "mrkdwn", text: title } },
+      ...sections.slice(0, 45).map((s) => ({ type: "section", text: { type: "mrkdwn", text: s } })),
+    ],
+  });
+  console.log(`Sent summary of ${tasks.length} pending task(s) in ${channel}`);
 }
 
 /** Custom times: open tasks whose own reminder time is `time` ("HH:MM", Philippine time). */
