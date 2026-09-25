@@ -9,7 +9,7 @@ Every message in the tasks channel that starts with `Task:` becomes a task. Othe
 ## Where it runs (production): Supabase, always on
 - **Edge Function** `slack-task-bot` in Supabase project **slack-task-bot** (Singapore region). Find the project ref in the Supabase dashboard URL. Source: `supabase/functions/slack-task-bot/index.ts`.
 - **Request URL** (Slack Event Subscriptions and Interactivity): `https://<PROJECT_REF>.supabase.co/functions/v1/slack-task-bot`
-- **Reminders:** a `pg_cron` job, `slack-task-reminders`, runs `0 0,4,7 * * *` UTC (8 AM, 12 PM and 3 PM Philippine time) and calls the function with `?action=remind`. The call is authenticated with a random secret in Supabase Vault (`slack_bot_cron_secret`).
+- **Reminders:** a `pg_cron` job, `slack-task-reminders`, runs `0 7,23 * * *` UTC (7 AM and 3 PM Philippine time) and calls the function with `?action=remind`. The call is authenticated with a random secret in Supabase Vault (`slack_bot_cron_secret`).
 - **Secrets:** set in the Supabase dashboard under Edge Functions > Secrets: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` and optionally `REMINDER_LOOKBACK_DAYS` and `SLACK_USER_TOKEN`.
 - **Removing the original `Task:` message** (optional, avoids duplicate text in the channel). A bot can only delete its own messages, so this needs a **workspace admin or owner's user token**:
   1. In the Slack app, go to **OAuth & Permissions**, then **User Token Scopes**, and add `chat:write`.
@@ -24,7 +24,7 @@ Every message in the tasks channel that starts with `Task:` becomes a task. Othe
 - **Tables:** `task_cards` and `completed_tasks` stop Slack retries and double clicks from creating duplicate cards or alerts.
 - **Logs:** Supabase dashboard > Edge Functions > slack-task-bot > Logs.
 - **Changing the default reminder times:** use `cron.alter_job` / `cron.schedule` in SQL. Times are in UTC, so subtract 8 hours from Philippine time.
-- **Custom time per task:** put a reminder time anywhere in the task and that task is reminded **every day at that time instead of** 8 AM, 12 PM and 3 PM, until it's marked done. Tasks without a time keep the default schedule.
+- **Custom time per task:** put a reminder time anywhere in the task and that task is reminded **every day at that time instead of** 7 AM and 3 PM, until it's marked done. Tasks without a time keep the default schedule.
   - Accepted phrasing (always Philippine time): `every 3pm`, `every day at 10am`, `everyday 9am`, `daily at 4:15 PM`, `@ 2:30pm`, `@ 14:30`, `remind me at 9am`.
   - Examples: `Task: Follow up @Ana every 3pm about the screenshots` and `Task: Pay supplier invoice @ 2:30pm`. The card shows "⏰ Reminder daily at …". A time at the very end is removed from the task text; one mid-sentence is left in place.
   - A plain `at 3pm` is **not** a reminder time (`Meet at 3pm with team` stays normal text), because it usually describes the task rather than when to be reminded. Use `every`, `daily`, `@` or `remind me at`. An invalid time (e.g. `every 13pm`) is ignored, and the task uses the default schedule.
@@ -152,8 +152,8 @@ The console should show `⚡️ Bolt app is running!`. Leave it running. Buttons
 - Click **✅ Mark as Done** on the bot's task card in the channel
 
 ## Daily reminders
-- Every day at **8:00 AM, 12:00 PM and 3:00 PM Philippine time**, the bot posts a separate channel message (not a thread reply) for every task that isn't done yet: "⏰ Reminder: @poster this task is still not done · open task", followed by the task text. "open task" links to the task's card.
-- It checks tasks from the last 30 days. You can change this with `REMINDER_LOOKBACK_DAYS` in `.env`, and the times with `REMINDER_HOURS` (24-hour clock, comma-separated, default `8,12,15`).
+- Every day at **7:00 AM and 3:00 PM Philippine time**, the bot posts a separate channel message (not a thread reply) for every task that isn't done yet: "⏰ Reminder: @poster this task is still not done · open task", followed by the task text. "open task" links to the task's card.
+- It checks tasks from the last 30 days. You can change this with `REMINDER_LOOKBACK_DAYS` in `.env`, and the times with `REMINDER_HOURS` (24-hour clock, comma-separated, default `7,15`).
 - If the PC was off at a reminder time, the bot sends **one** catch-up reminder when it starts. For example, started at 1 PM, it sends the 12 PM reminder once rather than both 8 AM and 12 PM.
 - Each reminder time goes out only once, even after restarts. The last one sent is stored in `.tmp/last_reminder_slot.txt`.
 - A task counts as open while its thread card still has the **Mark as Done** button.

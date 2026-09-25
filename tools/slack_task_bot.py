@@ -1,6 +1,6 @@
 """Slack task bot: turns messages in a tasks channel into tasks with a
 "Mark as Done" button, and posts an alert when a task is completed.
-Every day at 8 AM, 12 PM and 3 PM Philippine time it reminds open tasks in their thread.
+Every day at 7 AM and 3 PM Philippine time it reminds open tasks.
 
 Runs locally over Socket Mode (no public URL needed).
 Usage: python tools/slack_task_bot.py
@@ -35,8 +35,8 @@ MAX_TASK_TEXT_IN_VALUE = 1500
 
 # Daily reminders. Philippines is UTC+8 with no daylight saving.
 PH_TZ = timezone(timedelta(hours=8))
-# Hours of the day (24h, PH time) to send reminders: 8 AM, 12 PM, 3 PM.
-REMINDER_HOURS = sorted(int(h) for h in os.environ.get("REMINDER_HOURS", "8,12,15").split(","))
+# Hours of the day (24h, PH time) to send reminders: 7 AM, 3 PM.
+REMINDER_HOURS = sorted(int(h) for h in os.environ.get("REMINDER_HOURS", "7,15").split(","))
 REMINDER_LOOKBACK_DAYS = int(os.environ.get("REMINDER_LOOKBACK_DAYS", "30"))
 REMINDER_CHECK_SECONDS = 30
 # Remembers the last reminder slot sent ("YYYY-MM-DD HH"), so restarts don't send it twice.

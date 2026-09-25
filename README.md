@@ -4,7 +4,7 @@ A Slack bot for lightweight task tracking:
 
 - Post a message starting with `Task:` in any channel the bot is in, and the bot posts a task card with a **✅ Mark as Done** button.
 - Clicking the button marks the card done, adds a ✅ to the original message and posts a "Task completed" alert.
-- Open tasks get a reminder post at **8 AM, 12 PM and 3 PM Philippine time**.
+- Open tasks get a reminder post at **7 AM and 3 PM Philippine time**, or daily at their own time if the task says one (e.g. `every 3pm`).
 
 ## How it's built
 

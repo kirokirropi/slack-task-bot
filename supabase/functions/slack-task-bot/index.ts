@@ -3,7 +3,7 @@
 // - Slack sends message events and button clicks here (Events API + Interactivity Request URL).
 // - A "Task: ..." message in any channel the bot is a member of gets a separate card with a "Mark as Done" button.
 // - Clicking it updates the card, adds a ✅ to the original message and posts a completion alert.
-// - pg_cron calls this function with ?action=remind at 8 AM, 12 PM and 3 PM Philippine time,
+// - pg_cron calls this function with ?action=remind at 7 AM and 3 PM Philippine time,
 //   and it posts a reminder for every task that's still open.
 // - A task with its own time ("Task: Pay invoice every 3pm", "... @ 2:30pm") is instead reminded daily at that time:
 //   a per-minute pg_cron check calls ?action=remind_custom only when such a task is due.
@@ -350,7 +350,7 @@ async function sendReminders() {
   }
 }
 
-/** Default schedule (8 AM / 12 PM / 3 PM): every open task except those with their own reminder time. */
+/** Default schedule (7 AM / 3 PM): every open task except those with their own reminder time. */
 async function sendRemindersForChannel(channel: string, lookbackDays: number) {
   const { data: custom, error } = await db
     .from("task_cards").select("task_ts").eq("channel_id", channel).not("remind_time", "is", null);
