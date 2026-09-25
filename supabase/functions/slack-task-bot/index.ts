@@ -5,6 +5,8 @@
 // - Clicking it updates the card, adds a ✅ to the original message and posts a completion alert.
 // - pg_cron calls this function with ?action=remind at 8 AM, 12 PM and 3 PM Philippine time,
 //   and it posts a reminder for every task that's still open.
+// - A task ending in a time ("Task: Pay invoice @ 2:30pm") is instead reminded daily at that time:
+//   a per-minute pg_cron check calls ?action=remind_custom only when such a task is due.
 //
 // Secrets (Supabase dashboard > Edge Functions > Secrets):
 //   SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, REMINDER_LOOKBACK_DAYS (optional, default 30)
@@ -24,6 +26,34 @@ const DONE_EMOJI = "white_check_mark";
 const MAX_TASK_TEXT_IN_VALUE = 1500;
 // Each card's first block_id is "task:<original message ts>".
 const TASK_BLOCK_PREFIX = "task:";
+// Optional custom reminder time at the end of a task: "@ 2:30pm", "@2pm", "@ 14:30", "remind at 9am".
+const REMIND_TIME_RE = /\s*(?:@|remind(?:\s+me)?\s+at)\s*(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?\s*$/i;
+const REMIND_TIME_24H_RE = /\s*(?:@|remind(?:\s+me)?\s+at)\s*(\d{1,2}):(\d{2})\s*$/i;
+
+/** Splits a trailing reminder time off the task text. Returns 24h "HH:MM" (Philippine time) or null. */
+function parseRemindTime(text: string): { text: string; time: string | null } {
+  let hour: number, minute: number;
+  let m = REMIND_TIME_RE.exec(text);
+  if (m) {
+    hour = Number(m[1]) % 12 + (m[3].toLowerCase() === "p" ? 12 : 0);
+    minute = Number(m[2] ?? 0);
+    if (Number(m[1]) < 1 || Number(m[1]) > 12) return { text, time: null };
+  } else if ((m = REMIND_TIME_24H_RE.exec(text))) {
+    hour = Number(m[1]);
+    minute = Number(m[2]);
+  } else {
+    return { text, time: null };
+  }
+  if (hour > 23 || minute > 59) return { text, time: null };
+  const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  return { text: text.slice(0, m!.index).trim(), time };
+}
+
+/** "14:30" -> "2:30 PM" */
+function formatTime(time: string): string {
+  const [h, m] = time.split(":").map(Number);
+  return `${h % 12 || 12}:${String(m).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`;
+}
 
 function env(name: string, fallback?: string): string {
   const value = Deno.env.get(name) ?? fallback;
@@ -90,10 +120,13 @@ async function verifySlackSignature(req: Request, rawBody: string): Promise<bool
 
 // ---------- Blocks ----------
 
-function buildTaskBlocks(taskText: string, channel: string, taskTs: string, userId?: string, link = "") {
+function buildTaskBlocks(
+  taskText: string, channel: string, taskTs: string, userId?: string, link = "", remindTime: string | null = null,
+) {
   const value = JSON.stringify({ channel, ts: taskTs, user: userId, text: taskText.slice(0, MAX_TASK_TEXT_IN_VALUE) });
   let postedBy = userId ? `Posted by <@${userId}>` : "Task";
   if (link) postedBy += ` · <${link}|view message>`;
+  if (remindTime) postedBy += ` · :alarm_clock: Reminder daily at ${formatTime(remindTime)}`;
   return [
     { type: "section", block_id: `${TASK_BLOCK_PREFIX}${taskTs}`, text: { type: "mrkdwn", text: `:memo: *Task:* ${taskText}` } },
     { type: "context", elements: [{ type: "mrkdwn", text: postedBy }] },
@@ -178,20 +211,29 @@ async function handleMessage(event: any) {
   if (event.subtype || event.bot_id || event.thread_ts) return;
   if (event.channel_type === "im" || event.channel_type === "mpim") return; // not DMs
   const match = TASK_PREFIX_RE.exec(event.text ?? "");
-  const taskText = match?.[1].trim();
-  if (!taskText) return; // normal chat, not a task
-  if (!(await claimOnce("task_cards", { task_ts: event.ts, channel_id: event.channel }))) return;
+  if (!match) return; // normal chat, not a task
+  const { text: taskText, time: remindTime } = parseRemindTime(match[1].trim());
+  if (!taskText) return;
+  const claimed = await claimOnce("task_cards", {
+    task_ts: event.ts,
+    channel_id: event.channel,
+    task_text: taskText,
+    posted_by: event.user,
+    remind_time: remindTime,
+  });
+  if (!claimed) return;
 
   const userToken = Deno.env.get("SLACK_USER_TOKEN");
   try {
     // With a user token the original message is removed below, so don't link to it.
     const link = userToken ? "" : await permalink(event.channel, event.ts);
     // Posted as its own channel message (not a thread reply) so the button is visible in the channel.
-    await slack("chat.postMessage", {
+    const card = await slack("chat.postMessage", {
       channel: event.channel,
       text: `Task: ${taskText}`,
-      blocks: buildTaskBlocks(taskText, event.channel, event.ts, event.user, link),
+      blocks: buildTaskBlocks(taskText, event.channel, event.ts, event.user, link, remindTime),
     });
+    await db.from("task_cards").update({ card_ts: card.ts }).eq("task_ts", event.ts);
   } catch (e) {
     await db.from("task_cards").delete().eq("task_ts", event.ts); // let a retry try again
     throw e;
@@ -253,7 +295,7 @@ async function handleDone(payload: any) {
   console.log("Task marked done", taskTs, "by", userId);
 }
 
-type OpenTask = { threadTs: string; user?: string; text: string };
+type OpenTask = { taskTs: string; threadTs: string; user?: string; text: string };
 
 /** Open tasks = bot cards that still have the Mark as Done button. */
 async function findOpenTasks(channel: string, lookbackDays: number): Promise<OpenTask[]> {
@@ -271,7 +313,7 @@ async function findOpenTasks(channel: string, lookbackDays: number): Promise<Ope
         const button = doneButton(msg);
         if (button) {
           const v = JSON.parse(button.value);
-          open.push({ threadTs: msg.ts, user: v.user ?? undefined, text: v.text });
+          open.push({ taskTs: v.ts, threadTs: msg.ts, user: v.user ?? undefined, text: v.text });
         }
         continue;
       }
@@ -282,7 +324,7 @@ async function findOpenTasks(channel: string, lookbackDays: number): Promise<Ope
       const replies = await slack("conversations.replies", { channel, ts: msg.ts, limit: 200 });
       // deno-lint-ignore no-explicit-any
       if ((replies.messages as any[]).some((r) => r.bot_id === me && doneButton(r))) {
-        open.push({ threadTs: msg.ts, user: msg.user, text: match[1].trim() });
+        open.push({ taskTs: msg.ts, threadTs: msg.ts, user: msg.user, text: match[1].trim() });
       }
     }
     // deno-lint-ignore no-explicit-any
@@ -302,23 +344,57 @@ async function sendReminders() {
   }
 }
 
+/** Default schedule (8 AM / 12 PM / 3 PM): every open task except those with their own reminder time. */
 async function sendRemindersForChannel(channel: string, lookbackDays: number) {
-  const tasks = await findOpenTasks(channel, lookbackDays);
+  const { data: custom, error } = await db
+    .from("task_cards").select("task_ts").eq("channel_id", channel).not("remind_time", "is", null);
+  if (error) throw error;
+  const hasCustomTime = new Set(custom.map((r) => r.task_ts));
+
+  const tasks = (await findOpenTasks(channel, lookbackDays)).filter((t) => !hasCustomTime.has(t.taskTs));
   for (const task of tasks.reverse()) { // oldest first
-    const who = task.user ? `<@${task.user}> ` : "";
-    const link = await permalink(channel, task.threadTs);
-    const linkText = link ? ` · <${link}|open task>` : "";
-    // Posted as its own channel message (not a thread reply) so it's visible in the channel.
-    await slack("chat.postMessage", {
-      channel,
-      text: `:alarm_clock: ${who}Reminder: this task is still not done — ${task.text}`,
-      blocks: [{
-        type: "section",
-        text: { type: "mrkdwn", text: `:alarm_clock: *Reminder:* ${who}this task is still not done${linkText}\n>${task.text}` },
-      }],
-    });
+    await postReminder(channel, task.threadTs, task.user, task.text);
   }
   console.log(`Sent ${tasks.length} reminder(s) in ${channel}`);
+}
+
+/** Custom times: open tasks whose own reminder time is `time` ("HH:MM", Philippine time). */
+async function sendCustomReminders(time: string) {
+  const { data: due, error } = await db
+    .from("task_cards").select("task_ts, channel_id, card_ts, posted_by, task_text")
+    .eq("remind_time", `${time}:00`).not("card_ts", "is", null);
+  if (error) throw error;
+  if (!due.length) return;
+  const { data: done, error: doneError } = await db
+    .from("completed_tasks").select("task_ts").in("task_ts", due.map((r) => r.task_ts));
+  if (doneError) throw doneError;
+  const doneSet = new Set(done.map((r) => r.task_ts));
+
+  let sent = 0;
+  for (const task of due.filter((r) => !doneSet.has(r.task_ts))) {
+    try {
+      await postReminder(task.channel_id, task.card_ts, task.posted_by, task.task_text);
+      sent++;
+    } catch (e) {
+      console.error(`Custom reminder failed for task ${task.task_ts}:`, e);
+    }
+  }
+  console.log(`Sent ${sent} custom-time reminder(s) for ${time}`);
+}
+
+async function postReminder(channel: string, cardTs: string, user: string | undefined, text: string) {
+  const who = user ? `<@${user}> ` : "";
+  const link = await permalink(channel, cardTs);
+  const linkText = link ? ` · <${link}|open task>` : "";
+  // Posted as its own channel message (not a thread reply) so it's visible in the channel.
+  await slack("chat.postMessage", {
+    channel,
+    text: `:alarm_clock: ${who}Reminder: this task is still not done — ${text}`,
+    blocks: [{
+      type: "section",
+      text: { type: "mrkdwn", text: `:alarm_clock: *Reminder:* ${who}this task is still not done${linkText}\n>${text}` },
+    }],
+  });
 }
 
 function background(work: Promise<unknown>) {
@@ -331,12 +407,19 @@ Deno.serve(async (req) => {
   const url = new URL(req.url);
 
   // Scheduled reminders (pg_cron). Authenticated with a secret stored in Supabase Vault.
-  if (url.searchParams.get("action") === "remind") {
+  const action = url.searchParams.get("action");
+  if (action === "remind" || action === "remind_custom") {
     const { data: secret, error } = await db.rpc("slack_bot_cron_secret");
     if (error || !secret || req.headers.get("x-cron-secret") !== secret) {
       return new Response("forbidden", { status: 403 });
     }
-    background(sendReminders());
+    if (action === "remind") {
+      background(sendReminders());
+    } else {
+      const time = (await req.json().catch(() => ({})))?.time;
+      if (!/^\d{2}:\d{2}$/.test(time ?? "")) return new Response("bad time", { status: 400 });
+      background(sendCustomReminders(time));
+    }
     return new Response("reminders queued", { status: 202 });
   }
 

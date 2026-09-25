@@ -23,7 +23,12 @@ Every message in the tasks channel that starts with `Task:` becomes a task. Othe
   - Reminders check every channel that had a task card in the last 30 days, plus any channel listed in `task_channels`. Each card's channel is recorded in `task_cards.channel_id`.
 - **Tables:** `task_cards` and `completed_tasks` stop Slack retries and double clicks from creating duplicate cards or alerts.
 - **Logs:** Supabase dashboard > Edge Functions > slack-task-bot > Logs.
-- **Changing reminder times:** use `cron.alter_job` / `cron.schedule` in SQL. Times are in UTC, so subtract 8 hours from Philippine time.
+- **Changing the default reminder times:** use `cron.alter_job` / `cron.schedule` in SQL. Times are in UTC, so subtract 8 hours from Philippine time.
+- **Custom time per task:** end the task with a time and that task is reminded **every day at that time instead of** 8 AM, 12 PM and 3 PM, until it's marked done. Tasks without a time keep the default schedule.
+  - Accepted formats: `@ 2:30pm`, `@2pm`, `@ 14:30`, `remind at 9am`, `remind me at 12:15 PM`. The time must be at the **end** of the message and is always Philippine time.
+  - Example: `Task: Pay supplier invoice @ 2:30pm`. The card shows "⏰ Reminder daily at 2:30 PM", and the time is removed from the task text.
+  - A time in the middle of a sentence, like `Meet at 3pm with team`, is treated as normal text. An invalid time (e.g. `@ 25:00`) is ignored, and the task uses the default schedule.
+  - How it works: the `pg_cron` job `slack-task-custom-reminders` runs every minute in SQL. It only calls the function (`?action=remind_custom`) when an open task's `task_cards.remind_time` matches the current minute. The times are stored in `task_cards.remind_time`.
 - **Free-plan caveat:** Supabase can pause free projects after a stretch of low activity. If the bot goes silent, open the project in the dashboard and click **Restore**.
 - Database setup is recorded in `supabase/migrations/`.
 
