@@ -7,6 +7,7 @@
 //   and it posts one summary per channel listing the tasks that are still open, with links.
 // - A task with its own time ("Task: Pay invoice every 3pm", "... @ 2:30pm") is instead reminded daily at that time:
 //   a per-minute pg_cron check calls ?action=remind_custom only when such a task is due.
+// - Scheduled summaries and reminders are skipped on Saturday and Sunday (Philippine time).
 //
 // Secrets (Supabase dashboard > Edge Functions > Secrets):
 //   SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, REMINDER_LOOKBACK_DAYS (optional, default 30)
@@ -53,6 +54,12 @@ function parseRemindTime(text: string): { text: string; time: string | null } {
   const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
   const atEnd = text.slice(m.index + m[0].length).trim() === "";
   return { text: atEnd ? text.slice(0, m.index).trim() : text, time };
+}
+
+/** True on Saturday or Sunday in the Philippines (UTC+8, no daylight saving). */
+function isWeekendPH(now = new Date()): boolean {
+  const day = new Date(now.getTime() + 8 * 3600_000).getUTCDay(); // 0 = Sunday, 6 = Saturday
+  return day === 0 || day === 6;
 }
 
 /** "14:30" -> "2:30 PM" */
@@ -459,6 +466,12 @@ Deno.serve(async (req) => {
     const { data: secret, error } = await db.rpc("slack_bot_cron_secret");
     if (error || !secret || req.headers.get("x-cron-secret") !== secret) {
       return new Response("forbidden", { status: 403 });
+    }
+    // Scheduled summaries and reminders run Monday to Friday only (Philippine time).
+    // Task cards and Mark as Done still work on weekends, since a person just acted.
+    if (isWeekendPH()) {
+      console.log(`Weekend in the Philippines; skipping ${action}`);
+      return new Response("weekend: skipped", { status: 200 });
     }
     if (action === "remind") {
       background(sendReminders());
